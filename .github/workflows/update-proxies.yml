@@ -61,51 +61,50 @@ jobs:
         run: |
           pip install httpx[socks]
           
-          python3 - <<'PY'
-          import asyncio
-          import httpx
+          python3 -u - <<'PY'
+          import sys
           from concurrent.futures import ThreadPoolExecutor, as_completed
+          import httpx
           
           INPUT_FILE = '/tmp/unique_proxies.txt'
           OUTPUT_FILE = 'validated_proxies.txt'
           TEST_URL = 'https://api.ipify.org'
-          TIMEOUT = 5
-          MAX_WORKERS = 200
+          TIMEOUT = 4
+          MAX_WORKERS = 50
           
           def check_proxy(proxy_addr):
-              try:
-                  # Try HTTP first, then SOCKS5
-                  for scheme in ['http', 'socks5']:
+              for scheme in ['http', 'socks5']:
+                  try:
                       proxy_url = f"{scheme}://{proxy_addr}"
                       with httpx.Client(proxy=proxy_url, timeout=TIMEOUT) as client:
                           resp = client.get(TEST_URL)
                           if resp.status_code == 200:
-                              return (proxy_addr, scheme, resp.text.strip())
-              except Exception:
-                  pass
+                              return proxy_addr
+                  except Exception:
+                      continue
               return None
           
-          with open(INPUT_FILE, 'r') as f:
+          with open(INPUT_FILE) as f:
               proxies = [line.strip() for line in f if line.strip()]
           
-          print(f"Checking {len(proxies)} proxies...")
+          print(f"Checking {len(proxies)} proxies with {MAX_WORKERS} workers...", flush=True)
           working = []
+          done = 0
           
           with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
               futures = {executor.submit(check_proxy, p): p for p in proxies}
-              for i, future in enumerate(as_completed(futures), 1):
+              for future in as_completed(futures):
+                  done += 1
                   result = future.result()
                   if result:
                       working.append(result)
-                  if i % 500 == 0:
-                      print(f"Progress: {i}/{len(proxies)} checked, {len(working)} working")
+                  if done % 200 == 0 or done == len(proxies):
+                      print(f"Progress: {done}/{len(proxies)} checked, {len(working)} working", flush=True)
           
-          # Write only working proxies (normalized to ip:port)
           with open(OUTPUT_FILE, 'w') as f:
-              for addr, scheme, exit_ip in working:
-                  f.write(f"{addr}\n")
+              f.write('\n'.join(working) + '\n')
           
-          print(f"\nValidation complete: {len(working)} working out of {len(proxies)}")
+          print(f"\nValidation complete: {len(working)} working out of {len(proxies)}", flush=True)
           PY
 
       - name: Commit and Push Changes
