@@ -1,0 +1,124 @@
+name: Update Validated Proxy Lists
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-proxies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download and Aggregate Proxy Lists
+        run: |
+          mkdir -p /tmp/proxies
+          cd /tmp/proxies
+          
+          curl -sL "https://cdn.jsdelivr.net/gh/hproxy-com/free-proxy-list@main/all.txt" -o hproxy.txt
+          curl -sL "https://cdn.jsdelivr.net/gh/ProxyScrape/free-proxy-list@main/proxies/all/data.txt" -o proxyscrape.txt
+          curl -sL "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt" -o monosans.txt
+          curl -sL "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/all-proxies.txt" -o iplocate.txt
+          
+          cat *.txt > /tmp/raw_all.txt
+          echo "Total raw lines: $(wc -l < /tmp/raw_all.txt)"
+
+      - name: Deduplicate and Normalize
+        run: |
+          python3 - <<'PY'
+          import re
+          
+          def normalize(line):
+              line = line.strip()
+              if not line or line.startswith('#'):
+                  return None
+              line = re.sub(r'^[a-z0-9]+://', '', line)
+              if '@' in line:
+                  line = line.split('@')[-1]
+              return line if line else None
+          
+          seen = set()
+          with open('/tmp/raw_all.txt', 'r', errors='ignore') as f:
+              for line in f:
+                  addr = normalize(line)
+                  if addr and addr not in seen:
+                      seen.add(addr)
+          
+          with open('/tmp/unique_proxies.txt', 'w') as f:
+              f.write('\n'.join(sorted(seen)) + '\n')
+          
+          print(f"Unique proxies: {len(seen)}")
+          PY
+
+      - name: Validate Proxies (Keep Only Working Ones)
+        run: |
+          pip install httpx[socks]
+          
+          python3 - <<'PY'
+          import asyncio
+          import httpx
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          
+          INPUT_FILE = '/tmp/unique_proxies.txt'
+          OUTPUT_FILE = 'validated_proxies.txt'
+          TEST_URL = 'https://api.ipify.org'
+          TIMEOUT = 5
+          MAX_WORKERS = 200
+          
+          def check_proxy(proxy_addr):
+              try:
+                  # Try HTTP first, then SOCKS5
+                  for scheme in ['http', 'socks5']:
+                      proxy_url = f"{scheme}://{proxy_addr}"
+                      with httpx.Client(proxy=proxy_url, timeout=TIMEOUT) as client:
+                          resp = client.get(TEST_URL)
+                          if resp.status_code == 200:
+                              return (proxy_addr, scheme, resp.text.strip())
+              except Exception:
+                  pass
+              return None
+          
+          with open(INPUT_FILE, 'r') as f:
+              proxies = [line.strip() for line in f if line.strip()]
+          
+          print(f"Checking {len(proxies)} proxies...")
+          working = []
+          
+          with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+              futures = {executor.submit(check_proxy, p): p for p in proxies}
+              for i, future in enumerate(as_completed(futures), 1):
+                  result = future.result()
+                  if result:
+                      working.append(result)
+                  if i % 500 == 0:
+                      print(f"Progress: {i}/{len(proxies)} checked, {len(working)} working")
+          
+          # Write only working proxies (normalized to ip:port)
+          with open(OUTPUT_FILE, 'w') as f:
+              for addr, scheme, exit_ip in working:
+                  f.write(f"{addr}\n")
+          
+          print(f"\nValidation complete: {len(working)} working out of {len(proxies)}")
+          PY
+
+      - name: Commit and Push Changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add validated_proxies.txt
+          
+          if git diff --cached --quiet; then
+            echo "No changes to validated proxy list."
+          else
+            COUNT=$(wc -l < validated_proxies.txt)
+            git commit -m "chore: update validated proxies ($COUNT working) $(date -u +%Y-%m-%d-%H)"
+            git push
+          fi
